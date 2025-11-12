@@ -54,3 +54,53 @@ func (c *OpenAIClient) Generate(ctx context.Context, prompt string) (string, err
 
 	return resp.Choices[0].Message.Content, nil
 }
+
+// GenerateStream 生成流式响应
+func (c *OpenAIClient) GenerateStream(ctx context.Context, prompt string, responseChan chan<- string) error {
+	defer close(responseChan)
+
+	if prompt == "" {
+		return errors.New("prompt cannot be empty")
+	}
+
+	// 创建流式请求
+	stream, err := c.client.CreateChatCompletionStream(
+		ctx,
+		openai.ChatCompletionRequest{
+			Model: c.modelName,
+			Messages: []openai.ChatCompletionMessage{
+				{
+					Role:    openai.ChatMessageRoleUser,
+					Content: prompt,
+				},
+			},
+			MaxTokens: c.maxTokens,
+			Stream:    true,
+		},
+	)
+
+	if err != nil {
+		return err
+	}
+	defer stream.Close()
+
+	// 读取流式响应
+	for {
+		response, err := stream.Recv()
+		if errors.Is(err, context.Canceled) {
+			return nil
+		}
+		if err != nil {
+			// 流结束
+			return nil
+		}
+
+		// 发送内容片段
+		if len(response.Choices) > 0 {
+			content := response.Choices[0].Delta.Content
+			if content != "" {
+				responseChan <- content
+			}
+		}
+	}
+}

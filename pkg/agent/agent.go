@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"agentEino/pkg/logger"
 	"agentEino/pkg/memory"
 	"agentEino/pkg/tools"
 	"context"
@@ -214,7 +215,7 @@ func NewEinoAgent(config Config) *EinoAgent {
 	}
 }
 
-// Initialize 初始化EinoAgent
+// Initialize 初始EinoAgent
 func (a *EinoAgent) Initialize(ctx context.Context, llmClient LLMClient, toolManager *tools.ToolManager) error {
 	// 设置LLM客户端
 	a.llmClient = llmClient
@@ -222,9 +223,16 @@ func (a *EinoAgent) Initialize(ctx context.Context, llmClient LLMClient, toolMan
 	// 设置工具管理器
 	a.tools = toolManager
 
+	logger.Info("初始化Agent", map[string]interface{}{
+		"name": a.config.Name,
+		"provider": a.config.ModelConfig.Provider,
+		"model": a.config.ModelConfig.ModelName,
+	})
+
 	// 初始化内存系统
 	memory, err := initializeMemory(ctx, a.config.MemoryConfig)
 	if err != nil {
+		logger.Error("初始化内存系统失败", map[string]interface{}{"error": err.Error()})
 		return fmt.Errorf("初始化内存系统失败: %w", err)
 	}
 	a.memory = memory
@@ -232,9 +240,11 @@ func (a *EinoAgent) Initialize(ctx context.Context, llmClient LLMClient, toolMan
 	// 创建新对话
 	conversationID, err := a.memory.CreateConversation(ctx, "新对话")
 	if err != nil {
+		logger.Error("创建对话失败", map[string]interface{}{"error": err.Error()})
 		return fmt.Errorf("创建对话失败: %w", err)
 	}
 	a.currentConversationID = conversationID
+	logger.Debug("创建新对话", map[string]interface{}{"conversation_id": conversationID})
 
 	return nil
 }
@@ -300,7 +310,43 @@ func initializeMemory(ctx context.Context, config MemoryConfig) (Memory, error) 
 
 // extractToolCall 从响应中提取工具调用
 func (a *EinoAgent) extractToolCall(response string) (string, string) {
-	// 简单实现：检查是否包含工具调用标记
+	// 方法1: 检查 JSON 格式的 Function Calling
+	// 格式: {"tool":"tool_name","params":{...}}
+	if strings.Contains(response, `"tool"`) && strings.Contains(response, `"params"`) {
+		var toolCall struct {
+			Tool   string                 `json:"tool"`
+			Params map[string]interface{} `json:"params"`
+		}
+		if err := json.Unmarshal([]byte(response), &toolCall); err == nil {
+			if toolCall.Tool != "" {
+				paramsJSON, _ := json.Marshal(toolCall.Params)
+				return toolCall.Tool, string(paramsJSON)
+			}
+		}
+	}
+
+	// 方法2: 检查 Markdown 代码块格式
+	// 格式: ```tool:tool_name\n{params}\n```
+	if strings.Contains(response, "```tool:") {
+		start := strings.Index(response, "```tool:")
+		if start != -1 {
+			end := strings.Index(response[start+8:], "```")
+			if end != -1 {
+				block := response[start+8 : start+8+end]
+				lines := strings.SplitN(strings.TrimSpace(block), "\n", 2)
+				if len(lines) >= 1 {
+					toolName := strings.TrimSpace(lines[0])
+					params := ""
+					if len(lines) > 1 {
+						params = strings.TrimSpace(lines[1])
+					}
+					return toolName, params
+				}
+			}
+		}
+	}
+
+	// 方法3: 简单实现：检查是否包含工具调用标记（兼容旧格式）
 	if strings.Contains(response, "使用工具:") {
 		parts := strings.Split(response, "使用工具:")
 		if len(parts) > 1 {
@@ -359,12 +405,22 @@ func (a *EinoAgent) Process(ctx context.Context, input string) (string, error) {
 	// 提取工具调用（若存在）
 	toolName, toolParamsText := a.extractToolCall(preResp)
 	if toolName != "" {
+		logger.Info("检测到工具调用", map[string]interface{}{
+			"tool": toolName,
+			"conversation_id": a.currentConversationID,
+		})
 		// 解析参数
 		params := parseParams(toolParamsText)
 		// 执行工具
 		toolResult, err := a.ExecuteTool(ctx, toolName, params)
 		if err != nil {
+			logger.Error("工具执行失败", map[string]interface{}{
+				"tool": toolName,
+				"error": err.Error(),
+			})
 			toolResult = fmt.Sprintf("工具 %s 执行失败: %v", toolName, err)
+		} else {
+			logger.Debug("工具执行成功", map[string]interface{}{"tool": toolName})
 		}
 		// 将工具结果注入为系统消息，参与下一轮生成
 		a.messageHistory = append(a.messageHistory, Message{Role: "system", Content: fmt.Sprintf("工具(%s)输出: %v", toolName, toolResult)})
@@ -470,25 +526,40 @@ func (a *EinoAgent) ProcessStream(ctx context.Context, input string, responseCha
 		}
 	}()
 
+	// 发送思考事件
+	a.sendThinkingEvent(responseChan, "analyzing", "正在分析您的问题...")
+
 	// 第一轮非流式生成，仅用于解析工具调用
 	preResp, err := a.llmClient.Generate(ctx, fullPrompt)
 	if err != nil {
 		return fmt.Errorf("生成响应失败: %w", err)
 	}
+	
 	toolName, toolParamsText := a.extractToolCall(preResp)
 	if toolName != "" {
+		// 发送工具调用事件
+		a.sendThinkingEvent(responseChan, "tool_call", fmt.Sprintf("准备调用工具: %s", toolName))
+		
 		params := parseParams(toolParamsText)
 		toolResult, err := a.ExecuteTool(ctx, toolName, params)
 		if err != nil {
 			toolResult = fmt.Sprintf("工具 %s 执行失败: %v", toolName, err)
+			a.sendThinkingEvent(responseChan, "tool_error", fmt.Sprintf("工具执行失败: %v", err))
+		} else {
+			// 发送工具结果事件
+			a.sendThinkingEvent(responseChan, "tool_result", fmt.Sprintf("工具返回结果，正在生成最终回复..."))
 		}
+		
 		// 注入工具输出
 		a.messageHistory = append(a.messageHistory, Message{Role: "system", Content: fmt.Sprintf("工具(%s)输出: %v", toolName, toolResult)})
 		// 重新构建提示后进行流式最终生成
 		finalPrompt := a.buildPrompt()
+		a.sendThinkingEvent(responseChan, "generating", "正在生成回复...")
 		return a.llmClient.GenerateStream(ctx, finalPrompt, internalChan)
 	}
+	
 	// 无工具调用时直接流式生成
+	a.sendThinkingEvent(responseChan, "generating", "正在生成回复...")
 	return a.llmClient.GenerateStream(ctx, fullPrompt, internalChan)
 }
 
@@ -566,4 +637,11 @@ func parseParams(text string) map[string]interface{} {
 		}
 	}
 	return params
+}
+
+// sendThinkingEvent 发送思维链事件（仅在流式模式下）
+func (a *EinoAgent) sendThinkingEvent(responseChan chan<- string, eventType, message string) {
+	// 发送特殊格式的事件标记
+	eventData := fmt.Sprintf("[THINKING:%s:%s]", eventType, message)
+	responseChan <- eventData
 }

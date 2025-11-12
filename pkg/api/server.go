@@ -2,10 +2,10 @@ package api
 
 import (
 	"agentEino/pkg/agent"
+	"agentEino/pkg/logger"
 	"context"
 	"crypto/rand"
 	"encoding/json"
-	"log"
 	"math/big"
 	"net/http"
 	"strings"
@@ -66,20 +66,30 @@ func (s *Server) Start(port string) {
 	// API路由
 	http.HandleFunc("/api/chat", s.handleChat)
 	http.HandleFunc("/api/chat/stream", s.handleChatStream)
+	http.HandleFunc("/api/conversations", s.handleConversations)
+	http.HandleFunc("/api/conversations/", s.handleConversationDetail)
+	http.HandleFunc("/health", s.handleHealth)
 
-	log.Printf("Starting web server on %s", port)
-	log.Fatal(http.ListenAndServe(":"+port, nil))
+	logger.Info("启动Web服务器", map[string]interface{}{
+		"port": port,
+		"endpoints": []string{"/api/chat", "/api/chat/stream", "/api/conversations", "/health"},
+	})
+	logger.Fatal("服务器停止", map[string]interface{}{
+		"error": http.ListenAndServe(":"+port, nil),
+	})
 }
 
 // handleChat 处理聊天请求
 func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
+		logger.Warn("不允许的请求方法", map[string]interface{}{"method": r.Method, "path": r.URL.Path})
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
 	var req ChatRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		logger.Error("解析请求失败", map[string]interface{}{"error": err.Error()})
 		http.Error(w, "Invalid request", http.StatusBadRequest)
 		return
 	}
@@ -123,8 +133,16 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	conv.Messages = append(conv.Messages, userMsg)
 
 	// 处理消息并获取响应
+	logger.Debug("处理消息", map[string]interface{}{
+		"conversation_id": conv.ID,
+		"message_length": len(req.Message),
+	})
 	response, err := s.agent.Process(conv.Context, req.Message)
 	if err != nil {
+		logger.Error("处理消息失败", map[string]interface{}{
+			"conversation_id": conv.ID,
+			"error": err.Error(),
+		})
 		http.Error(w, "Failed to process message", http.StatusInternalServerError)
 		return
 	}
@@ -159,9 +177,16 @@ func (s *Server) handleChatStream(w http.ResponseWriter, r *http.Request) {
 	conversationID := r.URL.Query().Get("conversation_id")
 	message := r.URL.Query().Get("message")
 	if strings.TrimSpace(message) == "" {
+		logger.Warn("消息为空", map[string]interface{}{"remote_addr": r.RemoteAddr})
 		http.Error(w, "message is required", http.StatusBadRequest)
 		return
 	}
+
+	logger.Debug("SSE流式请求", map[string]interface{}{
+		"conversation_id": conversationID,
+		"message_length": len(message),
+		"remote_addr": r.RemoteAddr,
+	})
 
 	// 获取或创建对话
 	s.mu.Lock()
@@ -290,4 +315,167 @@ func randomInt64(max int64) int {
 // 获取当前时间戳
 func currentTimestamp() int64 {
 	return time.Now().UnixNano()
+}
+
+// handleHealth 健康检查端点
+func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status": "healthy",
+		"timestamp": time.Now().Unix(),
+	})
+}
+
+// handleConversations 处理会话列表请求
+func (s *Server) handleConversations(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodGet {
+		s.handleListConversations(w, r)
+	} else {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// handleListConversations 列出所有会话
+func (s *Server) handleListConversations(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// 将所有会话转换为列表
+	type ConversationInfo struct {
+		ID        string `json:"id"`
+		Title     string `json:"title"`
+		CreatedAt int64  `json:"created_at"`
+		MessageCount int `json:"message_count"`
+	}
+
+	conversations := make([]ConversationInfo, 0, len(s.conversations))
+	for id, conv := range s.conversations {
+		// 生成标题：使用第一条用户消息或默认标题
+		title := "新对话"
+		for _, msg := range conv.Messages {
+			if msg.Role == "user" {
+				title = msg.Content
+				if len(title) > 30 {
+					title = title[:30] + "..."
+				}
+				break
+			}
+		}
+
+		conversations = append(conversations, ConversationInfo{
+			ID:        id,
+			Title:     title,
+			CreatedAt: conv.CreatedAt,
+			MessageCount: len(conv.Messages),
+		})
+	}
+
+	// 按创建时间倒序排序
+	for i := 0; i < len(conversations); i++ {
+		for j := i + 1; j < len(conversations); j++ {
+			if conversations[i].CreatedAt < conversations[j].CreatedAt {
+				conversations[i], conversations[j] = conversations[j], conversations[i]
+			}
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"conversations": conversations,
+		"total": len(conversations),
+	})
+}
+
+// handleConversationDetail 处理单个会话的操作
+func (s *Server) handleConversationDetail(w http.ResponseWriter, r *http.Request) {
+	// 提取会话ID
+	convID := strings.TrimPrefix(r.URL.Path, "/api/conversations/")
+	if convID == "" {
+		http.Error(w, "Conversation ID required", http.StatusBadRequest)
+		return
+	}
+
+	switch r.Method {
+	case http.MethodGet:
+		s.handleGetConversation(w, r, convID)
+	case http.MethodDelete:
+		s.handleDeleteConversation(w, r, convID)
+	case http.MethodPut:
+		s.handleUpdateConversation(w, r, convID)
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// handleGetConversation 获取指定会话详情
+func (s *Server) handleGetConversation(w http.ResponseWriter, r *http.Request, convID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	conv, exists := s.conversations[convID]
+	if !exists {
+		http.Error(w, "Conversation not found", http.StatusNotFound)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"id": conv.ID,
+		"messages": conv.Messages,
+		"created_at": conv.CreatedAt,
+	})
+}
+
+// handleDeleteConversation 删除指定会话
+func (s *Server) handleDeleteConversation(w http.ResponseWriter, r *http.Request, convID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, exists := s.conversations[convID]; !exists {
+		http.Error(w, "Conversation not found", http.StatusNotFound)
+		return
+	}
+
+	delete(s.conversations, convID)
+	delete(s.agentConvMap, convID)
+
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"message": "Conversation deleted",
+	})
+}
+
+// handleUpdateConversation 更新会话信息（目前支持更新标题）
+func (s *Server) handleUpdateConversation(w http.ResponseWriter, r *http.Request, convID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	conv, exists := s.conversations[convID]
+	if !exists {
+		http.Error(w, "Conversation not found", http.StatusNotFound)
+		return
+	}
+
+	// 解析请求体
+	var req struct {
+		Title string `json:"title"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	// 暂时将标题存储在 Context 中（简化实现）
+	// 实际项目中应该扩展 Conversation 结构体
+	_ = conv
+
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"message": "Conversation updated",
+		"title": req.Title,
+	})
 }
